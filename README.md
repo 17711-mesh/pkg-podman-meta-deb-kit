@@ -1,4 +1,4 @@
-# 17711 Mesh - Podman Package Kit for Debian - Quickstart
+# Quickstart
 
 Build the meta package:
 ```bash
