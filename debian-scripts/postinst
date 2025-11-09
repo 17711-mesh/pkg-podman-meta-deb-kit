@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PODMAN_VERSION="@@PODMAN_VERSION@@"
+
+# Determine prefix
+if [[ -f /etc/podman-meta/prefix ]]; then
+  PREFIX="$(cat /etc/podman-meta/prefix)"
+else
+  PREFIX=""
+fi
+
+# If missing, try to create from /usr/local binaries
+if [[ -z "${PREFIX}" || ! -d "${PREFIX}" ]]; then
+  if [[ -x /usr/local/bin/podman ]]; then
+    # derive version from binary
+    ver="$(/usr/local/bin/podman --version 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p')"
+    if [[ -n "${ver}" ]]; then
+      PREFIX="/opt/podman-${ver}"
+      mkdir -p "${PREFIX}/bin" "${PREFIX}/lib" "${PREFIX}/libexec" "${PREFIX}/lib/systemd/system"
+      # Move/Copy binaries if they exist in /usr/local
+      for b in podman podman-remote quadlet crun conmon netavark aardvark-dns passt pasta; do
+        if [[ -x "/usr/local/bin/${b}" ]]; then
+          cp -f "/usr/local/bin/${b}" "${PREFIX}/bin/${b}"
+        fi
+      done
+      # Try to copy systemd units if in /usr/local
+      if [[ -d /usr/local/lib/systemd/system ]]; then
+        cp -a /usr/local/lib/systemd/system/podman.* "${PREFIX}/lib/systemd/system/" 2>/dev/null || true
+      fi
+      echo "${PREFIX}" > /etc/podman-meta/prefix
+    fi
+  fi
+fi
+
+# Ensure /opt/podman -> PREFIX
+if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
+  ln -sfn "${PREFIX}" /opt/podman
+else
+  echo "WARN: Podman prefix not found; expected something under /opt/podman-<version>." >&2
+fi
+
+# Default containers config
+mkdir -p /etc/containers
+if [[ ! -f /etc/containers/containers.conf ]]; then
+  cat > /etc/containers/containers.conf <<'EOF'
+[engine]
+runtime = "/opt/podman/bin/crun"
+helper_binaries_dir = ["/opt/podman/libexec", "/opt/podman/bin"]
+network_backend = "netavark"
+cgroup_manager = "systemd"
+EOF
+fi
+
+if [[ ! -f /etc/containers/registries.conf ]]; then
+  cat > /etc/containers/registries.conf <<'EOF'
+unqualified-search-registries = ["docker.io"]
+[registries.search]
+registries=["docker.io","quay.io","registry.fedoraproject.org"]
+[registries.block]
+registries=[]
+EOF
+fi
+
+# ops user for rootless
+if ! getent group ops >/dev/null 2>&1; then
+  addgroup --system ops || addgroup ops || true
+fi
+if ! id -u ops >/dev/null 2>&1; then
+  adduser --disabled-password --gecos "" --ingroup ops ops || true
+fi
+grep -q '^ops:' /etc/subuid || echo 'ops:100000:65536' >> /etc/subuid
+grep -q '^ops:' /etc/subgid || echo 'ops:100000:65536' >> /etc/subgid
+loginctl enable-linger ops || true
+install -d -m 0755 /etc/containers/systemd
+install -d -m 0755 /home/ops/.config/containers/systemd || true
+chown -R ops:ops /home/ops/.config/containers || true
+
+# Systemd unit files bound to /opt prefix (override any /usr/local ones)
+install -d /etc/systemd/system
+cat > /etc/systemd/system/podman.service <<'UNIT'
+[Unit]
+Description=Podman API Service
+Documentation=man:podman-system-service(1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Environment=LOGGING="--log-level=info"
+ExecStart=/opt/podman/bin/podman $LOGGING system service
+KillMode=process
+Restart=on-failure
+TimeoutStopSec=70
+Type=notify
+NotifyAccess=all
+
+[Install]
+WantedBy=multi-user.target
+Also=podman.socket
+UNIT
+
+cat > /etc/systemd/system/podman.socket <<'UNIT'
+[Unit]
+Description=Podman API Socket
+PartOf=podman.service
+
+[Socket]
+ListenStream=/run/podman/podman.sock
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+UNIT
+
+systemctl daemon-reload || true
+systemctl enable --now podman.socket || true
+
+# Capabilities on passt/pasta
+for bin in /opt/podman/bin/passt /opt/podman/bin/pasta; do
+  if [[ -x "${bin}" ]]; then
+    setcap cap_net_admin,cap_net_raw,cap_net_bind_service+ep "${bin}" || true
+  fi
+done
+
+# Convenience symlinks
+for b in podman podman-remote quadlet crun conmon netavark aardvark-dns passt pasta; do
+  if [[ -x "/opt/podman/bin/${b}" ]]; then
+    ln -sfn "/opt/podman/bin/${b}" "/usr/local/bin/${b}" || true
+  fi
+done
+
+# Refresh loader
+ldconfig || true
+
+# Example: create demo network & volume (idempotent)
+if /opt/podman/bin/podman network inspect demo >/dev/null 2>&1; then :; else
+  /opt/podman/bin/podman network create demo || true
+fi
+if /opt/podman/bin/podman volume inspect demo-vol >/dev/null 2>&1; then :; else
+  /opt/podman/bin/podman volume create demo-vol || true
+fi
+
+echo "podman-meta post-install complete."
+exit 0
